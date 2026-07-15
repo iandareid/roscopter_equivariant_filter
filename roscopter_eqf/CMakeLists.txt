@@ -85,6 +85,14 @@ install(TARGETS
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(test_phi test/test_phi.cpp)
+  target_include_directories(test_phi PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
+  ament_add_gtest(test_lambda test/test_lambda.cpp)
+  target_include_directories(test_lambda PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
