@@ -10,6 +10,8 @@ EstimatorEQF::EstimatorEQF()
 : roscopter::EstimatorROS()
 {
   declare_parameters();
+  initialize_state();
+  initialize_covariance();
   if (load_magnetic_model() != 0) {
     RCLCPP_ERROR(this->get_logger(), "Failed to load magnetic model.");
   }
@@ -25,6 +27,48 @@ void EstimatorEQF::declare_parameters()
   params_.declare_double("inclination", NOT_IN_USE);
   params_.declare_bool("force_declination_param", false);
   params_.declare_bool("require_gnss_for_heading_init", false);
+  params_.declare_double("gps_lever_arm_north", 0.0);
+  params_.declare_double("gps_lever_arm_east", 0.0);
+  params_.declare_double("gps_lever_arm_down", 0.0);
+  params_.declare_double("init_covariance_att", std::pow(0.05, 2));
+  params_.declare_double("init_covariance_pos", std::pow(0.5, 2));
+  params_.declare_double("init_covariance_vel", std::pow(0.05, 2));
+  params_.declare_double("init_covariance_gyro_bias", std::pow(0.001, 2));
+  params_.declare_double("init_covariance_accel_bias", std::pow(0.001, 2));
+  params_.declare_double("init_covariance_gnss_lever_arm", std::pow(0.001, 2));
+  params_.declare_double("init_covariance_mag_rotation", std::pow(0.001, 2));
+}
+
+void EstimatorEQF::initialize_state()
+{
+  reference_state_ = eqf::EqfState::Identity();
+  state_.reset();
+  state_.setGnssLeverArmImu(
+    Eigen::Vector3d(
+      this->get_parameter("gps_lever_arm_north").as_double(),
+      this->get_parameter("gps_lever_arm_east").as_double(),
+      this->get_parameter("gps_lever_arm_down").as_double()));
+}
+
+void EstimatorEQF::initialize_covariance()
+{
+  P_.setZero();
+  P_.block<3, 3>(eqf::ErrorState::kAttitudeOffset, eqf::ErrorState::kAttitudeOffset) =
+    this->get_parameter("init_covariance_att").as_double() * Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kVelocityOffset, eqf::ErrorState::kVelocityOffset) =
+    this->get_parameter("init_covariance_vel").as_double() * Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kPositionOffset, eqf::ErrorState::kPositionOffset) =
+    this->get_parameter("init_covariance_pos").as_double() * Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kGammaGyroOffset, eqf::ErrorState::kGammaGyroOffset) =
+    this->get_parameter("init_covariance_gyro_bias").as_double() * Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kGammaAccelOffset, eqf::ErrorState::kGammaAccelOffset) =
+    this->get_parameter("init_covariance_accel_bias").as_double() * Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kLeverArmOffset, eqf::ErrorState::kLeverArmOffset) =
+    this->get_parameter("init_covariance_gnss_lever_arm").as_double() *
+    Eigen::Matrix3d::Identity();
+  P_.block<3, 3>(eqf::ErrorState::kMagRotationOffset, eqf::ErrorState::kMagRotationOffset) =
+    this->get_parameter("init_covariance_mag_rotation").as_double() *
+    Eigen::Matrix3d::Identity();
 }
 
 void EstimatorEQF::estimate(const Input & input, Output & output)
@@ -117,12 +161,12 @@ bool EstimatorEQF::calc_mag_field_properties(const Input & input)
   const double configured_inclination = this->get_parameter("inclination").as_double();
 
   auto use_configured_mag = [&]() {
-    declination_ = configured_declination;
-    inclination_ = configured_inclination;
-    magnetic_reference_G_ = calculate_magnetic_reference(declination_rad(), inclination_rad());
-    mag_init_ = true;
-    return true;
-  };
+      declination_ = configured_declination;
+      inclination_ = configured_inclination;
+      magnetic_reference_G_ = calculate_magnetic_reference(declination_rad(), inclination_rad());
+      mag_init_ = true;
+      return true;
+    };
 
   if (require_gnss && !gps_init_) {
     return false;

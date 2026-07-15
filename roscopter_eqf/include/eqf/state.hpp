@@ -44,6 +44,14 @@ public:
     gnss_lever_arm_I_.setZero();
     R_IM_.setIdentity();
   }
+  
+  static EqfState Identity()
+  {
+    EqfState state;
+    state.reset();
+
+    return state;
+  }
 
   const SE23Matrix & navigationState() const
   {
