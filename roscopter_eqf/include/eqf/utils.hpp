@@ -2,6 +2,9 @@
 #define ROSCOPTER_EQF_UTILS_HPP
 
 #include <Eigen/Dense>
+#include <unsupported/Eigen/MatrixFunctions>
+
+#include <cmath>
 
 #include "eqf/equivariant_state.hpp"
 #include "eqf/state.hpp"
@@ -25,6 +28,17 @@ struct Lift
   Eigen::Vector3d lambda4 = Eigen::Vector3d::Zero();
 };
 
+struct ImuPropagationResult
+{
+  bool propagated = false;
+  double dt = 0.0;
+  State state_before = State::Identity();
+  Lift lift;
+  EquivariantState increment;
+  EquivariantState observer_after;
+  State state_after = State::Identity();
+};
+
 inline Eigen::Matrix3d skew_matrix(const Eigen::Vector3d & vec)
 {
   Eigen::Matrix3d skew;
@@ -46,6 +60,17 @@ inline Eigen::Matrix3d skew_matrix(const Eigen::Vector3d & vec)
   return result;
 }
 
+[[nodiscard]] inline EquivariantState::Se3AlgebraMatrix se3Wedge(
+  const Eigen::Vector3d & rotation,
+  const Eigen::Vector3d & translation)
+{
+  EquivariantState::Se3AlgebraMatrix result =
+    EquivariantState::Se3AlgebraMatrix::Zero();
+  result.block<3, 3>(0, 0) = skew_matrix(rotation);
+  result.block<3, 1>(0, 3) = translation;
+  return result;
+}
+
 [[nodiscard]] inline Vector6d se3LieBracket(
   const Vector6d & x,
   const Vector6d & y)
@@ -55,6 +80,77 @@ inline Eigen::Matrix3d skew_matrix(const Eigen::Vector3d & vec)
   result.tail<3>() =
     x.tail<3>().cross(y.head<3>()) + x.head<3>().cross(y.tail<3>());
   return result;
+}
+
+[[nodiscard]] inline Lift scaleLift(const Lift & lift, const double scale)
+{
+  Lift out;
+  out.lambda1 = scale * lift.lambda1;
+  out.lambda2 = scale * lift.lambda2;
+  out.lambda3 = scale * lift.lambda3;
+  out.lambda4 = scale * lift.lambda4;
+  return out;
+}
+
+[[nodiscard]] inline Vector6d biasVector(const EquivariantState & X)
+{
+  Vector6d gamma;
+  gamma.head<3>() = X.gammaGyro();
+  gamma.tail<3>() = X.gammaAccel();
+  return gamma;
+}
+
+[[nodiscard]] inline Vector6d applyBiasLinearPart(
+  const EquivariantState & X,
+  const Vector6d & bias)
+{
+  const Eigen::Matrix3d A = X.rotationBlock();
+  const Eigen::Vector3d c_v = X.firstTranslationColumn();
+
+  Vector6d transformed;
+  transformed.head<3>() = A.transpose() * bias.head<3>();
+  transformed.tail<3>() =
+    A.transpose() * (bias.tail<3>() - c_v.cross(bias.head<3>()));
+  return transformed;
+}
+
+[[nodiscard]] inline Vector6d invertBiasLinearPart(
+  const EquivariantState & X,
+  const Vector6d & transformed)
+{
+  const Eigen::Matrix3d A = X.rotationBlock();
+  const Eigen::Vector3d c_v = X.firstTranslationColumn();
+
+  Vector6d bias;
+  bias.head<3>() = A * transformed.head<3>();
+  bias.tail<3>() = A * transformed.tail<3>() + c_v.cross(bias.head<3>());
+  return bias;
+}
+
+[[nodiscard]] inline EquivariantState groupMultiply(
+  const EquivariantState & X,
+  const EquivariantState & Y)
+{
+  EquivariantState XY;
+  XY.setC(X.C() * Y.C());
+  XY.setDelta(X.delta() + X.rotationBlock() * Y.delta());
+  XY.setE(X.E() * Y.E());
+
+  const Vector6d gamma_xy =
+    biasVector(X) + invertBiasLinearPart(XY, applyBiasLinearPart(Y, biasVector(Y)));
+  XY.setGammaGyro(gamma_xy.head<3>());
+  XY.setGammaAccel(gamma_xy.tail<3>());
+  return XY;
+}
+
+[[nodiscard]] inline EquivariantState expGroup(const Lift & lift)
+{
+  EquivariantState out;
+  out.setC(lift.lambda1.exp());
+  out.setGamma(se3Wedge(lift.lambda2.head<3>(), lift.lambda2.tail<3>()));
+  out.setDelta(lift.lambda3);
+  out.setE(skew_matrix(lift.lambda4).exp());
+  return out;
 }
 
 [[nodiscard]] inline State phi(
@@ -147,6 +243,34 @@ inline Eigen::Matrix3d skew_matrix(const Eigen::Vector3d & vec)
   out.lambda3 = lambda3(state, input);
   out.lambda4 = lambda4(state, input);
   return out;
+}
+
+[[nodiscard]] inline ImuPropagationResult propagateImuBeforeA(
+  const EquivariantState & observer_state,
+  const State & reference_state,
+  const ImuInput & input,
+  const Eigen::Vector3d & gravity_in_inertial,
+  const double dt)
+{
+  ImuPropagationResult result;
+  result.dt = dt;
+  result.state_before = phi(observer_state, reference_state);
+  result.observer_after = observer_state;
+  result.state_after = result.state_before;
+
+  if (!std::isfinite(dt) || dt <= 0.0 ||
+    !input.angular_velocity.allFinite() ||
+    !input.linear_acceleration.allFinite())
+  {
+    return result;
+  }
+
+  result.lift = lambda(result.state_before, input, gravity_in_inertial);
+  result.increment = expGroup(scaleLift(result.lift, dt));
+  result.observer_after = groupMultiply(observer_state, result.increment);
+  result.state_after = phi(result.observer_after, reference_state);
+  result.propagated = true;
+  return result;
 }
 
 }  // namespace eqf

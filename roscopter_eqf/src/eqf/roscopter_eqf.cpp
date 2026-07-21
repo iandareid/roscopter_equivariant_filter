@@ -42,12 +42,14 @@ void EstimatorEQF::declare_parameters()
 void EstimatorEQF::initialize_state()
 {
   reference_state_ = eqf::EqfState::Identity();
-  state_.reset();
-  state_.setGnssLeverArmImu(
+  reference_state_.setGnssLeverArmImu(
     Eigen::Vector3d(
       this->get_parameter("gps_lever_arm_north").as_double(),
       this->get_parameter("gps_lever_arm_east").as_double(),
       this->get_parameter("gps_lever_arm_down").as_double()));
+  observer_state_.reset();
+  state_ = eqf::phi(observer_state_, reference_state_);
+  has_last_time_ = false;
 }
 
 void EstimatorEQF::initialize_covariance()
@@ -77,6 +79,9 @@ void EstimatorEQF::estimate(const Input & input, Output & output)
     calc_mag_field_properties(input);
   }
 
+  propagation_step(input);
+  measurement_update(input);
+
   const Eigen::Vector3d euler = state_.eulerAngles();
 
   output.pn = state_.pn();
@@ -103,6 +108,67 @@ void EstimatorEQF::estimate(const Input & input, Output & output)
   output.nees_valid = false;
 
   publish_accel_bias();
+}
+
+void EstimatorEQF::propagation_step(const Input & input)
+{
+  const eqf::ImuInput imu_input{
+    Eigen::Vector3d(input.gyro_x, input.gyro_y, input.gyro_z),
+    Eigen::Vector3d(input.accel_x, input.accel_y, input.accel_z)};
+
+  if (!imu_input.angular_velocity.allFinite() || !imu_input.linear_acceleration.allFinite()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(),
+      *this->get_clock(),
+      1000,
+      "Skipping EqF propagation because the IMU input contains NaN or infinity.");
+    return;
+  }
+
+  const rclcpp::Time current_time = this->get_clock()->now();
+  if (!has_last_time_) {
+    last_time_ = current_time;
+    has_last_time_ = true;
+    state_ = eqf::phi(observer_state_, reference_state_);
+    return;
+  }
+
+  const rclcpp::Duration dt_duration = current_time - last_time_;
+  last_time_ = current_time;
+  const double dt = dt_duration.nanoseconds() / 1e9;
+
+  if (!std::isfinite(dt) || dt <= 0.0) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(),
+      *this->get_clock(),
+      1000,
+      "Skipping EqF propagation because the computed time step is not positive and finite.");
+    state_ = eqf::phi(observer_state_, reference_state_);
+    return;
+  }
+
+  const Eigen::Vector3d gravity_in_inertial(
+    0.0,
+    0.0,
+    this->get_parameter("gravity").as_double());
+  const eqf::ImuPropagationResult propagation = eqf::propagateImuBeforeA(
+    observer_state_,
+    reference_state_,
+    imu_input,
+    gravity_in_inertial,
+    dt);
+
+  if (!propagation.propagated) {
+    state_ = eqf::phi(observer_state_, reference_state_);
+    return;
+  }
+
+  observer_state_ = propagation.observer_after;
+  state_ = propagation.state_after;
+}
+
+void EstimatorEQF::measurement_update(const Input &)
+{
 }
 
 void EstimatorEQF::calculate_nees(const roscopter_msgs::msg::State &, Output & output)

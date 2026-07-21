@@ -8,6 +8,7 @@
 #include "eqf/error_state.hpp"
 #include "eqf/equivariant_state.hpp"
 #include "eqf/state.hpp"
+#include "eqf/utils.hpp"
 #include "ekf/estimator_ros.hpp"
 
 class EstimatorEQF : public roscopter::EstimatorROS
@@ -22,6 +23,8 @@ private:
   void declare_parameters();
   void initialize_state();
   void initialize_covariance();
+  void propagation_step(const Input & input);
+  void measurement_update(const Input & input);
   void publish_accel_bias();
   bool calc_mag_field_properties(const Input & input);
   Eigen::Vector3d calculate_magnetic_reference(
@@ -39,6 +42,8 @@ private:
   double declination_ = 0.0;
   double inclination_ = NOT_IN_USE;
   bool declination_fallback_warned_ = false;
+  bool has_last_time_ = false;
+  rclcpp::Time last_time_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr accel_bias_pub_;
 };
 

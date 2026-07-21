@@ -93,6 +93,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lambda test/test_lambda.cpp)
   target_include_directories(test_lambda PUBLIC include ${EIGEN3_INCLUDE_DIRS})
 
+  ament_add_gtest(test_propagation test/test_propagation.cpp)
+  target_include_directories(test_propagation PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
