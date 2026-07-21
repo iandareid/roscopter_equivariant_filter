@@ -236,8 +236,8 @@ public:
   {
     Eigen::Matrix3d result;
     result << 0.0, -vector.z(), vector.y(),
-              vector.z(), 0.0, -vector.x(),
-              -vector.y(), vector.x(), 0.0;
+      vector.z(), 0.0, -vector.x(),
+      -vector.y(), vector.x(), 0.0;
     return result;
   }
 

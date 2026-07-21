@@ -44,7 +44,7 @@ public:
     gnss_lever_arm_I_.setZero();
     R_IM_.setIdentity();
   }
-  
+
   static EqfState Identity()
   {
     EqfState state;
