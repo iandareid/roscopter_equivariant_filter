@@ -10,6 +10,7 @@ EstimatorEQF::EstimatorEQF()
 : roscopter::EstimatorROS()
 {
   declare_parameters();
+  params_.set_parameters();
   initialize_state();
   initialize_covariance();
   if (load_magnetic_model() != 0) {
@@ -22,7 +23,6 @@ EstimatorEQF::EstimatorEQF()
 
 void EstimatorEQF::declare_parameters()
 {
-  params_.declare_double("gravity", 9.80665);
   params_.declare_double("declination", 10.6);
   params_.declare_double("inclination", NOT_IN_USE);
   params_.declare_bool("force_declination_param", false);
@@ -37,6 +37,22 @@ void EstimatorEQF::declare_parameters()
   params_.declare_double("init_covariance_accel_bias", std::pow(0.001, 2));
   params_.declare_double("init_covariance_gnss_lever_arm", std::pow(0.001, 2));
   params_.declare_double("init_covariance_mag_rotation", std::pow(0.001, 2));
+  params_.declare_bool("eqf_measurement_update_enabled", true);
+  params_.declare_bool("eqf_robust_inflation_enabled", true);
+  params_.declare_double("eqf_robust_alpha_magnetometer", 0.5);
+  params_.declare_double("eqf_robust_alpha_gnss_position", 0.5);
+  params_.declare_double("eqf_robust_alpha_gnss_velocity", 0.5);
+  params_.declare_double("eqf_innovation_covariance_jitter", 1.0e-9);
+  params_.declare_double("eqf_covariance_jitter", 1.0e-12);
+  params_.declare_double("eqf_minimum_direction_norm", 1.0e-9);
+  params_.declare_double("eqf_maximum_condition_number", 1.0e12);
+  params_.declare_double("sigma_n_gps", 7.0);
+  params_.declare_double("sigma_e_gps", 7.0);
+  params_.declare_double("sigma_d_gps", 7.0);
+  params_.declare_double("sigma_vn_gps", 0.08);
+  params_.declare_double("sigma_ve_gps", 0.08);
+  params_.declare_double("sigma_vd_gps", 0.08);
+  params_.declare_double("sigma_mag", 0.03);
 }
 
 void EstimatorEQF::initialize_state()
@@ -167,8 +183,181 @@ void EstimatorEQF::propagation_step(const Input & input)
   state_ = propagation.state_after;
 }
 
-void EstimatorEQF::measurement_update(const Input &)
+void EstimatorEQF::measurement_update(const Input & input)
 {
+  if (!params_.get_bool("eqf_measurement_update_enabled")) {
+    return;
+  }
+
+  // Deterministic sequential policy: each successful update becomes the prior
+  // for the next sensor.
+  gnss_position_measurement_update_step(input);
+  gnss_velocity_measurement_update_step(input);
+  magnetometer_measurement_update_step(input);
+}
+
+eqf::RobustUpdateConfig EstimatorEQF::robust_update_config(const double alpha)
+{
+  eqf::RobustUpdateConfig config;
+  config.alpha = alpha;
+  config.robust_inflation_enabled = params_.get_bool("eqf_robust_inflation_enabled");
+  config.innovation_covariance_jitter =
+    params_.get_double("eqf_innovation_covariance_jitter");
+  config.covariance_jitter = params_.get_double("eqf_covariance_jitter");
+  config.maximum_condition_number = params_.get_double("eqf_maximum_condition_number");
+  return config;
+}
+
+void EstimatorEQF::commit_measurement_update(
+  const eqf::RobustUpdateResult & result,
+  const char * sensor_name)
+{
+  const auto & diagnostics = result.diagnostics;
+  if (!diagnostics.accepted) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Rejected EqF %s update because its inputs or numerical solve were invalid.", sensor_name);
+    return;
+  }
+
+  observer_state_ = result.observer_after;
+  state_ = result.state_after;
+  P_ = result.covariance_after;
+  error_state_.reset();
+
+  if (diagnostics.numerical_regularization_used) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Regularized EqF %s measurement covariance.", sensor_name);
+  }
+  if (diagnostics.post_inflation_normalized_innovation > 1.0 + 1.0e-8) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "EqF %s post-inflation normalized innovation is %.6f (> 1).",
+      sensor_name, diagnostics.post_inflation_normalized_innovation);
+  }
+  RCLCPP_DEBUG_THROTTLE(
+    this->get_logger(), *this->get_clock(), 1000,
+    "EqF %s update: r=%.6f beta=%.6f alpha=%.3f correction_norm=%.6e",
+    sensor_name, diagnostics.normalized_innovation_magnitude, diagnostics.beta,
+    diagnostics.alpha, diagnostics.delta_epsilon.norm());
+}
+
+void EstimatorEQF::gnss_position_measurement_update_step(const Input & input)
+{
+  if (!input.gps_new || !gps_init_) {
+    return;
+  }
+  const Eigen::Vector3d measurement(input.gps_n, input.gps_e, -input.gps_h);
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  const double sigma_n = params_.get_double("sigma_n_gps");
+  const double sigma_e = params_.get_double("sigma_e_gps");
+  const double sigma_d = params_.get_double("sigma_d_gps");
+  if (!std::isfinite(sigma_n) || !std::isfinite(sigma_e) || !std::isfinite(sigma_d) ||
+    sigma_n < 0.0 || sigma_e < 0.0 || sigma_d < 0.0)
+  {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF GNSS position update because its noise parameters are invalid.");
+    return;
+  }
+  covariance.diagonal() << sigma_n * sigma_n, sigma_e * sigma_e, sigma_d * sigma_d;
+
+  try {
+    const eqf::RobustUpdateResult result = eqf::applyRobustEqfCorrection(
+      eqf::MeasurementType::kGnssPosition,
+      eqf::gnssPositionInnovation(state_, measurement),
+      eqf::computeGnssPositionCStar(observer_state_, measurement),
+      covariance,
+      robust_update_config(params_.get_double("eqf_robust_alpha_gnss_position")),
+      reference_state_, observer_state_, P_);
+    commit_measurement_update(result, "GNSS position");
+  } catch (const std::exception & exception) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF GNSS position update: %s", exception.what());
+  }
+}
+
+void EstimatorEQF::gnss_velocity_measurement_update_step(const Input & input)
+{
+  if (!input.gps_new || !gps_init_) {
+    return;
+  }
+  const Eigen::Vector3d measurement(input.gps_vn, input.gps_ve, input.gps_vd);
+  const Eigen::Vector3d measured_rate(input.gyro_x, input.gyro_y, input.gyro_z);
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  const double sigma_n = params_.get_double("sigma_vn_gps");
+  const double sigma_e = params_.get_double("sigma_ve_gps");
+  const double sigma_d = params_.get_double("sigma_vd_gps");
+  if (!std::isfinite(sigma_n) || !std::isfinite(sigma_e) || !std::isfinite(sigma_d) ||
+    sigma_n < 0.0 || sigma_e < 0.0 || sigma_d < 0.0)
+  {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF GNSS velocity update because its noise parameters are invalid.");
+    return;
+  }
+  covariance.diagonal() << sigma_n * sigma_n, sigma_e * sigma_e, sigma_d * sigma_d;
+
+  try {
+    const Eigen::Vector3d corrected_rate = state_.correctedAngularRate(measured_rate);
+    const eqf::RobustUpdateResult result = eqf::applyRobustEqfCorrection(
+      eqf::MeasurementType::kGnssVelocity,
+      eqf::gnssVelocityInnovation(state_, measurement, corrected_rate),
+      eqf::computeGnssVelocityCStar(observer_state_, measurement, corrected_rate),
+      covariance,
+      robust_update_config(params_.get_double("eqf_robust_alpha_gnss_velocity")),
+      reference_state_, observer_state_, P_);
+    commit_measurement_update(result, "GNSS velocity");
+  } catch (const std::exception & exception) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF GNSS velocity update: %s", exception.what());
+  }
+}
+
+void EstimatorEQF::magnetometer_measurement_update_step(const Input & input)
+{
+  if (!input.mag_new || !mag_init_) {
+    return;
+  }
+  const Eigen::Vector3d measurement(input.mag_x, input.mag_y, input.mag_z);
+  const double minimum_norm = params_.get_double("eqf_minimum_direction_norm");
+  if (!measurement.allFinite() || !std::isfinite(minimum_norm) ||
+    minimum_norm <= 0.0 || measurement.norm() <= minimum_norm)
+  {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF magnetometer update because the direction is invalid.");
+    return;
+  }
+
+  const double sigma = params_.get_double("sigma_mag");
+  if (!std::isfinite(sigma) || sigma < 0.0) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF magnetometer update because sigma_mag is invalid.");
+    return;
+  }
+  const Eigen::Matrix3d covariance = sigma * sigma * Eigen::Matrix3d::Identity();
+  try {
+    const Eigen::Vector3d prediction =
+      eqf::predictedMagnetometerDirection(state_, magnetic_reference_G_);
+    const eqf::RobustUpdateResult result = eqf::applyRobustEqfCorrection(
+      eqf::MeasurementType::kMagnetometer,
+      eqf::magnetometerResidual(observer_state_, measurement, magnetic_reference_G_),
+      eqf::computeMagnetometerCStar(
+        observer_state_, prediction, magnetic_reference_G_),
+      covariance,
+      robust_update_config(params_.get_double("eqf_robust_alpha_magnetometer")),
+      reference_state_, observer_state_, P_);
+    commit_measurement_update(result, "magnetometer");
+  } catch (const std::exception & exception) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF magnetometer update: %s", exception.what());
+  }
 }
 
 void EstimatorEQF::calculate_nees(const roscopter_msgs::msg::State &, Output & output)

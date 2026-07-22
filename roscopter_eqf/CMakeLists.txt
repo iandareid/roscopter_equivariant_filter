@@ -102,6 +102,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_measurement test/test_measurement.cpp)
   target_include_directories(test_measurement PUBLIC include ${EIGEN3_INCLUDE_DIRS})
 
+  ament_add_gtest(test_robust_measurement test/test_robust_measurement.cpp)
+  target_include_directories(test_robust_measurement PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

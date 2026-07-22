@@ -7,6 +7,7 @@
 
 #include "eqf/error_state.hpp"
 #include "eqf/equivariant_state.hpp"
+#include "eqf/robust_measurement.hpp"
 #include "eqf/state.hpp"
 #include "eqf/utils.hpp"
 #include "ekf/estimator_ros.hpp"
@@ -25,6 +26,13 @@ private:
   void initialize_covariance();
   void propagation_step(const Input & input);
   void measurement_update(const Input & input);
+  void gnss_position_measurement_update_step(const Input & input);
+  void gnss_velocity_measurement_update_step(const Input & input);
+  void magnetometer_measurement_update_step(const Input & input);
+  eqf::RobustUpdateConfig robust_update_config(double alpha);
+  void commit_measurement_update(
+    const eqf::RobustUpdateResult & result,
+    const char * sensor_name);
   void publish_accel_bias();
   bool calc_mag_field_properties(const Input & input);
   Eigen::Vector3d calculate_magnetic_reference(
