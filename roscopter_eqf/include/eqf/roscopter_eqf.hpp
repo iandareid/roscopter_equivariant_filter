@@ -5,8 +5,14 @@
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <cstdint>
+
+#include "eqf/covariance.hpp"
 #include "eqf/error_state.hpp"
+#include "eqf/error_dynamics.hpp"
 #include "eqf/equivariant_state.hpp"
+#include "eqf/initialization.hpp"
+#include "eqf/process_noise.hpp"
 #include "eqf/robust_measurement.hpp"
 #include "eqf/state.hpp"
 #include "eqf/utils.hpp"
@@ -24,6 +30,7 @@ private:
   void declare_parameters();
   void initialize_state();
   void initialize_covariance();
+  bool initialize_heading(const Input & input);
   void propagation_step(const Input & input);
   void measurement_update(const Input & input);
   void gnss_position_measurement_update_step(const Input & input);
@@ -43,6 +50,9 @@ private:
 
   eqf::State state_;
   EqfCovariance P_;
+  EqfCovariance A_begin_ = EqfCovariance::Zero();
+  eqf::Matrix21x18d L_ = eqf::Matrix21x18d::Zero();
+  eqf::Matrix18d Qc_ = eqf::Matrix18d::Zero();
   eqf::State reference_state_;
   eqf::ErrorState error_state_;
   eqf::EquivariantState observer_state_;
@@ -50,8 +60,9 @@ private:
   double declination_ = 0.0;
   double inclination_ = NOT_IN_USE;
   bool declination_fallback_warned_ = false;
+  bool state_initialized_ = false;
   bool has_last_time_ = false;
-  rclcpp::Time last_time_;
+  int64_t last_imu_stamp_nanoseconds_ = 0;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr accel_bias_pub_;
 };
 

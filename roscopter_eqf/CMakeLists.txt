@@ -99,6 +99,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_covariance test/test_covariance.cpp)
   target_include_directories(test_covariance PUBLIC include ${EIGEN3_INCLUDE_DIRS})
 
+  ament_add_gtest(test_error_dynamics test/test_error_dynamics.cpp)
+  target_include_directories(test_error_dynamics PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
+  ament_add_gtest(test_initialization test/test_initialization.cpp)
+  target_include_directories(test_initialization PUBLIC include ${EIGEN3_INCLUDE_DIRS})
+
   ament_add_gtest(test_measurement test/test_measurement.cpp)
   target_include_directories(test_measurement PUBLIC include ${EIGEN3_INCLUDE_DIRS})
 

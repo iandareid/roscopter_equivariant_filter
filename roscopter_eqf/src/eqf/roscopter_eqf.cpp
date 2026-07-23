@@ -9,6 +9,7 @@
 EstimatorEQF::EstimatorEQF()
 : roscopter::EstimatorROS()
 {
+  enable_event_driven_updates();
   declare_parameters();
   params_.set_parameters();
   initialize_state();
@@ -26,14 +27,14 @@ void EstimatorEQF::declare_parameters()
   params_.declare_double("declination", 10.6);
   params_.declare_double("inclination", NOT_IN_USE);
   params_.declare_bool("force_declination_param", false);
-  params_.declare_bool("require_gnss_for_heading_init", false);
+  params_.declare_bool("require_gnss_for_heading_init", true);
   params_.declare_double("gps_lever_arm_north", 0.0);
   params_.declare_double("gps_lever_arm_east", 0.0);
   params_.declare_double("gps_lever_arm_down", 0.0);
-  params_.declare_double("init_covariance_att", std::pow(0.05, 2));
-  params_.declare_double("init_covariance_pos", std::pow(0.5, 2));
-  params_.declare_double("init_covariance_vel", std::pow(0.05, 2));
-  params_.declare_double("init_covariance_gyro_bias", std::pow(0.001, 2));
+  params_.declare_double("init_covariance_att", std::pow(5.0 * 0.017, 2));
+  params_.declare_double("init_covariance_pos", 0.0001);
+  params_.declare_double("init_covariance_vel", 0.0001);
+  params_.declare_double("init_covariance_gyro_bias", 0.0001);
   params_.declare_double("init_covariance_accel_bias", std::pow(0.001, 2));
   params_.declare_double("init_covariance_gnss_lever_arm", std::pow(0.001, 2));
   params_.declare_double("init_covariance_mag_rotation", std::pow(0.001, 2));
@@ -53,6 +54,12 @@ void EstimatorEQF::declare_parameters()
   params_.declare_double("sigma_ve_gps", 0.08);
   params_.declare_double("sigma_vd_gps", 0.08);
   params_.declare_double("sigma_mag", 0.03);
+  params_.declare_double("eqf_gyro_noise_density", 0.4 * M_PI / 180.0);
+  params_.declare_double("eqf_accel_noise_density", 0.6);
+  params_.declare_double("eqf_gyro_bias_random_walk", 1.0e-7);
+  params_.declare_double("eqf_accel_bias_random_walk", 0.001);
+  params_.declare_double("eqf_gnss_lever_arm_random_walk", 0.0);
+  params_.declare_double("eqf_mag_calibration_random_walk", 0.0);
 }
 
 void EstimatorEQF::initialize_state()
@@ -65,7 +72,9 @@ void EstimatorEQF::initialize_state()
       this->get_parameter("gps_lever_arm_down").as_double()));
   observer_state_.reset();
   state_ = eqf::phi(observer_state_, reference_state_);
+  state_initialized_ = false;
   has_last_time_ = false;
+  last_imu_stamp_nanoseconds_ = 0;
 }
 
 void EstimatorEQF::initialize_covariance()
@@ -87,15 +96,35 @@ void EstimatorEQF::initialize_covariance()
   P_.block<3, 3>(eqf::ErrorState::kMagRotationOffset, eqf::ErrorState::kMagRotationOffset) =
     this->get_parameter("init_covariance_mag_rotation").as_double() *
     Eigen::Matrix3d::Identity();
+
+  eqf::ProcessNoise noise;
+  noise.gyro_noise_density.setConstant(params_.get_double("eqf_gyro_noise_density"));
+  noise.accel_noise_density.setConstant(params_.get_double("eqf_accel_noise_density"));
+  noise.gyro_bias_random_walk.setConstant(params_.get_double("eqf_gyro_bias_random_walk"));
+  noise.accel_bias_random_walk.setConstant(params_.get_double("eqf_accel_bias_random_walk"));
+  noise.gnss_lever_arm_random_walk.setConstant(
+    params_.get_double("eqf_gnss_lever_arm_random_walk"));
+  noise.mag_calibration_random_walk.setConstant(
+    params_.get_double("eqf_mag_calibration_random_walk"));
+  L_ = eqf::makeProcessNoiseMapL();
+  Qc_ = eqf::makeContinuousProcessNoiseCovariance(noise);
 }
 
 void EstimatorEQF::estimate(const Input & input, Output & output)
 {
-  if (!mag_init_) {
-    calc_mag_field_properties(input);
+  if (!state_initialized_) {
+    if (!mag_init_) {
+      calc_mag_field_properties(input);
+    }
+    if (!initialize_heading(input)) {
+      return;
+    }
+    return;
   }
 
-  propagation_step(input);
+  if (input.imu_new) {
+    propagation_step(input);
+  }
   measurement_update(input);
 
   const Eigen::Vector3d euler = state_.eulerAngles();
@@ -104,9 +133,11 @@ void EstimatorEQF::estimate(const Input & input, Output & output)
   output.pe = state_.pe();
   output.pd = state_.pd();
 
-  output.vx = state_.v_x();
-  output.vy = state_.v_y();
-  output.vz = state_.v_z();
+  const Eigen::Vector3d velocity_body =
+    state_.rotationGlobalFromImu().transpose() * state_.velocityGlobal();
+  output.vx = velocity_body.x();
+  output.vy = velocity_body.y();
+  output.vz = velocity_body.z();
 
   output.phi = euler.x();
   output.theta = euler.y();
@@ -126,6 +157,35 @@ void EstimatorEQF::estimate(const Input & input, Output & output)
   publish_accel_bias();
 }
 
+bool EstimatorEQF::initialize_heading(const Input & input)
+{
+  if (!mag_init_ || !input.mag_new) {
+    return false;
+  }
+
+  const std::optional<double> heading = eqf::headingFromMagnetometer(
+    Eigen::Vector3d(input.mag_x, input.mag_y, input.mag_z), declination_rad());
+  if (!heading.has_value()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Waiting to initialize EqF heading because the magnetometer sample is invalid.");
+    return false;
+  }
+
+  reference_state_.setRotationGlobalFromImu(
+    eqf::rotationGlobalFromImuAtHeading(*heading));
+  observer_state_.reset();
+  error_state_.reset();
+  state_ = eqf::phi(observer_state_, reference_state_);
+  state_initialized_ = true;
+  has_last_time_ = false;
+  last_imu_stamp_nanoseconds_ = 0;
+
+  RCLCPP_INFO(
+    this->get_logger(), "Initialized EqF heading to %.6f rad from magnetometer.", *heading);
+  return true;
+}
+
 void EstimatorEQF::propagation_step(const Input & input)
 {
   const eqf::ImuInput imu_input{
@@ -141,17 +201,25 @@ void EstimatorEQF::propagation_step(const Input & input)
     return;
   }
 
-  const rclcpp::Time current_time = this->get_clock()->now();
+  const int64_t current_stamp_nanoseconds = input.imu_stamp_nanoseconds;
+  if (current_stamp_nanoseconds <= 0) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(),
+      *this->get_clock(),
+      1000,
+      "Skipping EqF propagation because the IMU timestamp is invalid.");
+    return;
+  }
+
   if (!has_last_time_) {
-    last_time_ = current_time;
+    last_imu_stamp_nanoseconds_ = current_stamp_nanoseconds;
     has_last_time_ = true;
     state_ = eqf::phi(observer_state_, reference_state_);
     return;
   }
 
-  const rclcpp::Duration dt_duration = current_time - last_time_;
-  last_time_ = current_time;
-  const double dt = dt_duration.nanoseconds() / 1e9;
+  const double dt =
+    static_cast<double>(current_stamp_nanoseconds - last_imu_stamp_nanoseconds_) * 1e-9;
 
   if (!std::isfinite(dt) || dt <= 0.0) {
     RCLCPP_WARN_THROTTLE(
@@ -167,6 +235,12 @@ void EstimatorEQF::propagation_step(const Input & input)
     0.0,
     0.0,
     this->get_parameter("gravity").as_double());
+  // Equation (10) is evaluated at the beginning of this IMU interval.
+  // A_begin_ is retained for covariance propagation once the paper-derived
+  // 21x18 noise-input mapping L is available.
+  const eqf::State state_begin = eqf::phi(observer_state_, reference_state_);
+  A_begin_ = eqf::buildErrorDynamicsA(
+    observer_state_, state_begin, imu_input, gravity_in_inertial);
   const eqf::ImuPropagationResult propagation = eqf::propagateImuBeforeA(
     observer_state_,
     reference_state_,
@@ -179,8 +253,22 @@ void EstimatorEQF::propagation_step(const Input & input)
     return;
   }
 
+  eqf::CovariancePropagationResult covariance_propagation;
+  try {
+    covariance_propagation =
+      eqf::propagateCovarianceSecondOrder(P_, A_begin_, L_, Qc_, dt);
+  } catch (const std::exception & exception) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping EqF propagation because covariance propagation failed: %s", exception.what());
+    state_ = eqf::phi(observer_state_, reference_state_);
+    return;
+  }
+
+  last_imu_stamp_nanoseconds_ = current_stamp_nanoseconds;
   observer_state_ = propagation.observer_after;
   state_ = propagation.state_after;
+  P_ = covariance_propagation.P_pred;
 }
 
 void EstimatorEQF::measurement_update(const Input & input)
@@ -415,7 +503,20 @@ bool EstimatorEQF::calc_mag_field_properties(const Input & input)
   const double configured_declination = this->get_parameter("declination").as_double();
   const double configured_inclination = this->get_parameter("inclination").as_double();
 
+  auto configured_mag_is_valid = [&]() {
+      return std::isfinite(configured_declination) &&
+             std::isfinite(configured_inclination) &&
+             configured_declination >= -180.0 && configured_declination <= 180.0 &&
+             configured_inclination >= -90.0 && configured_inclination <= 90.0;
+    };
+
   auto use_configured_mag = [&]() {
+      if (!configured_mag_is_valid()) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Configured magnetic inclination or declination is outside its valid range.");
+        return false;
+      }
       declination_ = configured_declination;
       inclination_ = configured_inclination;
       magnetic_reference_G_ = calculate_magnetic_reference(declination_rad(), inclination_rad());
@@ -423,12 +524,12 @@ bool EstimatorEQF::calc_mag_field_properties(const Input & input)
       return true;
     };
 
-  if (require_gnss && !gps_init_) {
-    return false;
-  }
-
   if (force_param) {
     return use_configured_mag();
+  }
+
+  if (require_gnss && !has_fix_) {
+    return false;
   }
 
   if (has_fix_) {
